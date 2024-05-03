@@ -70,6 +70,7 @@ struct Human {
     thread_width: usize,
     dimm_color: Option<Color>,
     bright_colors: bool,
+    message_only: bool,
 }
 
 impl Human {
@@ -114,6 +115,8 @@ impl Human {
         } else {
             Some(("%H:%M:%S.%f", 12))
         };
+        let message_only =
+            args.is_present("message_only") || config_get("terminal_message_only").unwrap_or(false);
 
         let bright_colors = args.is_present("bright_colors")
             || config_get("terminal_bright_colors").unwrap_or(false);
@@ -127,6 +130,7 @@ impl Human {
             process_width: 0,
             thread_width: 0,
             bright_colors,
+            message_only,
         }
     }
 
@@ -215,59 +219,66 @@ impl Human {
             && (self.highlight.iter().any(|r| r.is_match(&record.tag))
                 || self.highlight.iter().any(|r| r.is_match(&record.message)));
 
-        let preamble_width = timestamp.chars().count()
+        let do_preamble = !self.message_only;
+        let preamble_width = if do_preamble {
+            timestamp.chars().count()
             + 1 // " "
             + tag.chars().count()
             + 2 // " ("
             + pid.chars().count() + tid.chars().count()
             + 2 // ") "
-            + 3; // level
-
-        let timestamp_color = if highlight {
-            Some(Color::Yellow)
+            + 3 // level
         } else {
-            self.dimm_color
+            0
         };
-        let tag_color = Self::hashed_color(&record.tag);
-        let pid_color = Self::hashed_color(&pid);
-        let tid_color = Self::hashed_color(&tid);
+
         let level_color = match record.level {
             Level::Info => Some(Color::Green),
             Level::Warn => Some(Color::Yellow),
             Level::Error | Level::Fatal | Level::Assert => Some(Color::Red),
             _ => self.dimm_color,
         };
+        let preamble = |buffer: &mut Buffer| -> Result<(), Error> {
+            let timestamp_color = if highlight {
+                Some(Color::Yellow)
+            } else {
+                self.dimm_color
+            };
+            let tag_color = Self::hashed_color(&record.tag);
+            let pid_color = Self::hashed_color(&pid);
+            let tid_color = Self::hashed_color(&tid);
 
-        let write_preamble = |buffer: &mut Buffer| -> Result<(), Error> {
-            let mut spec = ColorSpec::new();
-            buffer.set_color(spec.set_fg(timestamp_color))?;
-            buffer.write_all(timestamp.as_bytes())?;
-            buffer.write_all(b" ")?;
+            let write_preamble = |buffer: &mut Buffer| -> Result<(), Error> {
+                let mut spec = ColorSpec::new();
+                buffer.set_color(spec.set_fg(timestamp_color))?;
+                buffer.write_all(timestamp.as_bytes())?;
+                buffer.write_all(b" ")?;
 
-            buffer.set_color(spec.set_fg(Some(tag_color)))?;
-            buffer.write_all(tag.as_bytes())?;
-            buffer.set_color(spec.set_fg(None))?;
+                buffer.set_color(spec.set_fg(Some(tag_color)))?;
+                buffer.write_all(tag.as_bytes())?;
+                buffer.set_color(spec.set_fg(None))?;
 
-            buffer.write_all(b" (")?;
-            buffer.set_color(spec.set_fg(Some(pid_color)))?;
-            buffer.write_all(pid.as_bytes())?;
-            if !tid.is_empty() {
-                buffer.set_color(spec.set_fg(Some(tid_color)))?;
-                buffer.write_all(tid.as_bytes())?;
-            }
-            buffer.set_color(spec.set_fg(None))?;
-            buffer.write_all(b") ")?;
+                buffer.write_all(b" (")?;
+                buffer.set_color(spec.set_fg(Some(pid_color)))?;
+                buffer.write_all(pid.as_bytes())?;
+                if !tid.is_empty() {
+                    buffer.set_color(spec.set_fg(Some(tid_color)))?;
+                    buffer.write_all(tid.as_bytes())?;
+                }
+                buffer.set_color(spec.set_fg(None))?;
+                buffer.write_all(b") ")?;
 
-            buffer.set_color(
-                spec.set_bg(level_color)
-                    .set_fg(level_color.map(|_| Color::Black)), // Set fg only if bg is set
-            )?;
-            write!(buffer, " {} ", record.level)?;
-            buffer.set_color(&ColorSpec::new())?;
+                buffer.set_color(
+                    spec.set_bg(level_color)
+                        .set_fg(level_color.map(|_| Color::Black)), // Set fg only if bg is set
+                )?;
+                write!(buffer, " {} ", record.level)?;
+                buffer.set_color(&ColorSpec::new())?;
 
-            Ok(())
+                Ok(())
+            };
+            write_preamble(buffer)
         };
-
         let payload_len = terminal_width().unwrap_or(std::usize::MAX) - preamble_width - 3;
         let message = record.message.replace('\t', "");
         let message_len = message.chars().count();
@@ -276,7 +287,9 @@ impl Human {
         let mut buffer = self.writer.buffer();
 
         for i in 0..chunks {
-            write_preamble(&mut buffer)?;
+            if do_preamble {
+                preamble(&mut buffer)?;
+            }
 
             let c = if chunks == 1 {
                 "   "

@@ -26,6 +26,7 @@ use crate::{
 use clap::{values_t, ArgMatches};
 use failure::{err_msg, format_err, Error};
 use futures::{Async, AsyncSink, Poll, Sink, StartSend};
+use itertools::intersperse;
 use regex::Regex;
 use rogcat::record::{Format, Level, Record};
 use std::{
@@ -66,8 +67,10 @@ struct Human {
     date_format: Option<(&'static str, usize)>,
     highlight: Vec<Regex>,
     process_width: usize,
+    process_width_max: usize,
     tag_width: Option<usize>,
     thread_width: usize,
+    thread_width_max: usize,
     dimm_color: Option<Color>,
     bright_colors: bool,
     message_only: bool,
@@ -98,12 +101,12 @@ impl Human {
                 _ => ColorChoice::Auto,
             }
         };
-        let no_dimm = args.is_present("no_dimm") || config_get("terminal_no_dimm").unwrap_or(false);
+        let no_dimm = args.is_present("no-dimm") || config_get("terminal_no_dimm").unwrap_or(false);
         let tag_width = config_get("terminal_tag_width");
-        let hide_timestamp = args.is_present("hide_timestamp")
+        let hide_timestamp = args.is_present("hide-timestamp")
             || config_get("terminal_hide_timestamp").unwrap_or(false);
         let show_date =
-            args.is_present("show_date") || config_get("terminal_show_date").unwrap_or(false);
+            args.is_present("show-date") || config_get("terminal_show_date").unwrap_or(false);
         let date_format = if show_date {
             if hide_timestamp {
                 Some(("%m-%d", 5))
@@ -120,6 +123,8 @@ impl Human {
 
         let bright_colors = args.is_present("bright_colors")
             || config_get("terminal_bright_colors").unwrap_or(false);
+        let thread_width_max = max(1, config_get("terminal_thread_width_max").unwrap_or(16));
+        let process_width_max = max(1, config_get("terminal_process_width_max").unwrap_or(16));
 
         Human {
             writer: BufferWriter::stdout(color),
@@ -128,7 +133,9 @@ impl Human {
             date_format,
             tag_width,
             process_width: 0,
+            process_width_max,
             thread_width: 0,
+            thread_width_max,
             bright_colors,
             message_only,
         }
@@ -175,7 +182,7 @@ impl Human {
         })
     }
 
-    fn print(&mut self, record: &Record) -> Result<(), Error> {
+    fn print(&mut self, mut record: Record) -> Result<(), Error> {
         let timestamp = if let Some((format, len)) = self.date_format {
             if let Some(ref ts) = record.timestamp {
                 let mut ts = time::strftime(format, ts).expect("Date format error");
@@ -188,46 +195,63 @@ impl Human {
             String::new()
         };
 
-        let tag_width = self.tag_width();
-        let tag_chars = record.tag.chars().count();
-        let tag = format!(
-            "{:>width$}",
-            record
-                .tag
-                .chars()
-                .take(min(tag_width, tag_chars))
-                .collect::<String>(),
-            width = tag_width
-        );
+        // Calculate colors before truncation
+        let process_color = Self::hashed_color(&record.process);
+        let thread_color = Self::hashed_color(&record.thread);
 
-        self.process_width = max(self.process_width, record.process.chars().count());
-        let pid = if record.process.is_empty() {
-            " ".repeat(self.process_width)
-        } else {
-            format!("{:<width$}", record.process, width = self.process_width)
-        };
-        self.thread_width = max(self.thread_width, record.thread.chars().count());
-        let tid = if !record.thread.is_empty() {
-            format!(" {:>width$}", record.thread, width = self.thread_width)
-        } else if self.thread_width != 0 {
-            " ".repeat(self.thread_width + 1)
-        } else {
-            String::new()
-        };
+        /// Truncate `s` to width characters, adding "…" if necessary
+        fn format_trim(s: &mut String, width: usize) {
+            let len = s.chars().count();
+            if len > width {
+                s.truncate(width);
+                s.pop();
+                s.push('…');
+            }
+
+            if len < width {
+                s.reserve(width - len);
+                for _ in 0..(width - len) {
+                    s.push(' ')
+                }
+            }
+        }
+
+        // Tag
+        let tag_width = self.tag_width();
+
+        // Process
+        self.process_width = min(
+            max(self.process_width, record.process.chars().count()),
+            self.process_width_max,
+        );
+        format_trim(&mut record.process, self.process_width);
+
+        // Thread
+        self.thread_width = min(
+            max(self.thread_width, record.thread.chars().count()),
+            self.thread_width_max,
+        );
+        format_trim(&mut record.thread, self.thread_width);
 
         let highlight = !self.highlight.is_empty()
-            && (self.highlight.iter().any(|r| r.is_match(&record.tag))
+            && (self
+                .highlight
+                .iter()
+                .any(|r| record.tags.iter().any(|t| r.is_match(t)))
                 || self.highlight.iter().any(|r| r.is_match(&record.message)));
 
         let do_preamble = !self.message_only;
+
         let preamble_width = if do_preamble {
             timestamp.chars().count()
-            + 1 // " "
-            + tag.chars().count()
-            + 2 // " ("
-            + pid.chars().count() + tid.chars().count()
-            + 2 // ") "
-            + 3 // level
+                + 1 // " "
+                + tag_width
+                + 2 // " ("
+                + self.process_width
+                + 1
+                + self.thread_width
+                + 2 // ") "
+                + 3 // level
         } else {
             0
         };
@@ -238,49 +262,98 @@ impl Human {
             Level::Error | Level::Fatal | Level::Assert => Some(Color::Red),
             _ => self.dimm_color,
         };
-        let preamble = |buffer: &mut Buffer| -> Result<(), Error> {
+
+        let Record {
+            message,
+            level,
+            tags,
+            process,
+            thread,
+            ..
+        } = record;
+
+        // Collect as many tags as needed
+        let mut tags: Vec<_> = {
+            let tags = tags.into_iter().map(|t| {
+                let chars = t.chars().count();
+                let color = Self::hashed_color(&t);
+                (t, chars, Some(color))
+            });
+
+            // Add spaces between the tags
+            let tags = intersperse(tags, (" ".to_string(), 1, None));
+
+            let mut space_left = tag_width;
+            let space_left = &mut space_left;
+            let mut tags = tags
+                .into_iter()
+                .map_while(|(mut tag, chars, color)| {
+                    if *space_left == 0 {
+                        return None;
+                    }
+
+                    let left = *space_left;
+                    *space_left = space_left.saturating_sub(chars);
+
+                    if *space_left == 0 {
+                        format_trim(&mut tag, left);
+                    }
+                    Some((tag, color))
+                })
+                .collect::<Vec<_>>();
+
+            if *space_left > 0 {
+                tags.push((" ".repeat(*space_left), None));
+            }
+            tags
+        };
+
+        let mut preamble = |buffer: &mut Buffer| -> Result<(), Error> {
+            let mut spec = ColorSpec::new();
+
             let timestamp_color = if highlight {
                 Some(Color::Yellow)
             } else {
                 self.dimm_color
             };
-            let tag_color = Self::hashed_color(&record.tag);
-            let pid_color = Self::hashed_color(&pid);
-            let tid_color = Self::hashed_color(&tid);
 
-            let write_preamble = |buffer: &mut Buffer| -> Result<(), Error> {
-                let mut spec = ColorSpec::new();
-                buffer.set_color(spec.set_fg(timestamp_color))?;
-                buffer.write_all(timestamp.as_bytes())?;
-                buffer.write_all(b" ")?;
+            // Timestamp
+            buffer.set_color(spec.set_fg(timestamp_color))?;
+            buffer.write_all(timestamp.as_bytes())?;
 
-                buffer.set_color(spec.set_fg(Some(tag_color)))?;
+            // Tags
+            buffer.write_all(b" ")?;
+            for (tag, color) in &mut tags {
+                buffer.set_color(spec.set_fg(*color))?;
                 buffer.write_all(tag.as_bytes())?;
-                buffer.set_color(spec.set_fg(None))?;
+            }
 
-                buffer.write_all(b" (")?;
-                buffer.set_color(spec.set_fg(Some(pid_color)))?;
-                buffer.write_all(pid.as_bytes())?;
-                if !tid.is_empty() {
-                    buffer.set_color(spec.set_fg(Some(tid_color)))?;
-                    buffer.write_all(tid.as_bytes())?;
-                }
-                buffer.set_color(spec.set_fg(None))?;
-                buffer.write_all(b") ")?;
+            // Process and thread
+            buffer.set_color(spec.set_fg(None))?;
+            buffer.write_all(b" (")?;
+            buffer.set_color(spec.set_fg(Some(process_color)))?;
+            buffer.write_all(process.as_bytes())?;
+            if !thread.is_empty() {
+                buffer.set_color(spec.set_fg(Some(thread_color)))?;
+                buffer.write_all(b" ")?;
+                buffer.write_all(thread.as_bytes())?;
+            }
+            buffer.set_color(spec.set_fg(None))?;
+            buffer.write_all(b") ")?;
 
-                buffer.set_color(
-                    spec.set_bg(level_color)
-                        .set_fg(level_color.map(|_| Color::Black)), // Set fg only if bg is set
-                )?;
-                write!(buffer, " {} ", record.level)?;
-                buffer.set_color(&ColorSpec::new())?;
+            // Level
+            buffer.set_color(
+                spec.set_bg(level_color)
+                    .set_fg(level_color.map(|_| Color::Black)),
+            )?;
+            write!(buffer, " {} ", level)?;
+            buffer.set_color(&ColorSpec::new())?;
 
-                Ok(())
-            };
-            write_preamble(buffer)
+            Ok(())
         };
-        let payload_len = terminal_width().unwrap_or(std::usize::MAX) - preamble_width - 3;
-        let message = record.message.replace('\t', "");
+
+        let payload_len = terminal_width().unwrap_or(usize::MAX) - preamble_width - 3;
+        let message = message.replace('\t', "<TAB>");
         let message_len = message.chars().count();
         let chunks = message_len / payload_len + 1;
 
@@ -349,7 +422,7 @@ impl<T: Write> Sink for FormatSink<T> {
     fn start_send(&mut self, record: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
         self.sink
             .write_all(self.format.fmt_record(&record)?.as_bytes())?;
-        self.sink.write_all(&[b'\n'])?;
+        self.sink.write_all(b"\n")?;
         self.sink.flush()?;
         Ok(AsyncSink::Ready)
     }
@@ -364,7 +437,7 @@ impl Sink for Human {
     type SinkError = Error;
 
     fn start_send(&mut self, record: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        self.print(&record).map(|_| AsyncSink::Ready)
+        self.print(record).map(|_| AsyncSink::Ready)
     }
 
     fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {

@@ -5,7 +5,6 @@ use futures::{Poll, Stream};
 use std::{
     cmp,
     io::{self, BufRead},
-    usize,
 };
 use tokio::{
     codec::{Decoder, Encoder},
@@ -55,7 +54,7 @@ where
             Ok(None.into())
         } else {
             // Strip all \r\n occurences because on Windows "adb logcat" ends lines with "\r\r\n"
-            while self.buffer.ends_with(&[b'\r']) || self.buffer.ends_with(&[b'\n']) {
+            while self.buffer.ends_with(b"\r") || self.buffer.ends_with(b"\n") {
                 self.buffer.pop();
             }
             let line = String::from_utf8_lossy(&self.buffer).into();

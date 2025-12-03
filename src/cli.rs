@@ -211,6 +211,12 @@ pub fn cli() -> App<'static, 'static> {
                .takes_value(true)
                .multiple(true)
                .help("Same as -t/--tag but case insensitive"))
+          .arg(Arg::with_name("package")
+               .short("k")
+               .long("package")
+               .takes_value(true)
+               .multiple(true)
+               .help("Filter by exact package name"))
 
           // Fuchsia
           .arg(Arg::with_name("fuchsia")

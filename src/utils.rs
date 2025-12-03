@@ -65,3 +65,71 @@ pub fn config_get<'a, T: Deserialize<'a>>(key: &'a str) -> Option<T> {
 pub fn config_init() {
     drop(CONFIG.read().expect("Failed to get config lock"));
 }
+
+pub fn get_pids(packages: &[String]) -> Result<std::collections::HashSet<u32>, Error> {
+    if packages.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let mut command = std::process::Command::new(adb()?);
+    command.arg("shell").arg("pidof");
+    for pkg in packages {
+        command.arg(pkg);
+    }
+
+    let output = command.stdout(std::process::Stdio::piped()).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut pids = std::collections::HashSet::new();
+
+    for word in stdout.split_whitespace() {
+        if let Ok(pid) = word.parse::<u32>() {
+            pids.insert(pid);
+        }
+    }
+
+    Ok(pids)
+}
+
+pub struct ProcessFilter {
+    packages: Vec<String>,
+    valid_pids: std::collections::HashSet<u32>,
+    last_update: std::time::Instant,
+}
+
+impl ProcessFilter {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    pub fn new(packages: Vec<String>) -> Self {
+        // Initialize with a past timestamp so it updates immediately on first use
+        let last_update = std::time::Instant::now()
+            .checked_sub(Self::TTL + std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+
+        Self {
+            packages,
+            valid_pids: std::collections::HashSet::new(),
+            last_update,
+        }
+    }
+
+    pub fn should_skip_process(&mut self, pid_str: &str) -> bool {
+        if self.packages.is_empty() || pid_str.is_empty() {
+            return false;
+        }
+
+        let pid: u32 = match pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_update) > Self::TTL {
+            if let Ok(pids) = get_pids(&self.packages) {
+                self.valid_pids = pids;
+            }
+            self.last_update = now;
+        }
+
+        !self.valid_pids.contains(&pid)
+    }
+}

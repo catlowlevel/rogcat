@@ -20,7 +20,7 @@
 
 use crate::{
     profiles::Profile,
-    utils::{config_get, terminal_width},
+    utils::{self, config_get, terminal_width},
     LogSink,
 };
 use clap::{values_t, ArgMatches};
@@ -74,6 +74,7 @@ struct Human {
     dimm_color: Option<Color>,
     bright_colors: bool,
     message_only: bool,
+    process_filter: utils::ProcessFilter,
 }
 
 impl Human {
@@ -126,6 +127,15 @@ impl Human {
         let thread_width_max = max(1, config_get("terminal_thread_width_max").unwrap_or(16));
         let process_width_max = max(1, config_get("terminal_process_width_max").unwrap_or(16));
 
+        let mut packages: Vec<String> = vec![];
+
+        if let Some(values) = args.values_of("package") {
+            packages.extend(values.map(String::from));
+        }
+
+        let process_filter = utils::ProcessFilter::new(packages);
+
+        // process_filter.packages.clear();
         Human {
             writer: BufferWriter::stdout(color),
             dimm_color: if no_dimm { None } else { Some(DIMM_COLOR) },
@@ -138,6 +148,7 @@ impl Human {
             thread_width_max,
             bright_colors,
             message_only,
+            process_filter,
         }
     }
 
@@ -183,6 +194,9 @@ impl Human {
     }
 
     fn print(&mut self, mut record: Record) -> Result<(), Error> {
+        if self.process_filter.should_skip_process(&record.process) {
+            return Ok(());
+        }
         let timestamp = if let Some((format, len)) = self.date_format {
             if let Some(ref ts) = record.timestamp {
                 let mut ts = time::strftime(format, ts).expect("Date format error");
